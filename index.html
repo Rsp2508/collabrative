@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Step 3 - Collaborative Filtering</title>
+<style>
+  :root{--bg:#f7f7fb;--card:#fff;--ink:#1d1d2b;--muted:#6b6b80;--accent:#5b5bd6;--accent-soft:#e8e8fb;--star:#e0a100;--border:#e2e2ec}
+  @media (prefers-color-scheme: dark){:root{--bg:#14141c;--card:#1e1e2a;--ink:#ececf4;--muted:#9a9ab0;--accent:#8c8cf0;--accent-soft:#2a2a44;--star:#f5c542;--border:#2e2e3e}}
+  *{box-sizing:border-box}
+  body{margin:0 auto;padding:24px 16px;max-width:960px;font-family:system-ui,sans-serif;background:var(--bg);color:var(--ink);line-height:1.5}
+  .cols{display:grid;grid-template-columns:1fr;gap:24px}
+  @media (min-width:760px){.cols{grid-template-columns:1.2fr 1fr}}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:8px 12px;margin-bottom:8px}
+  .stars button{border:0;background:none;font-size:20px;cursor:pointer;color:var(--border);padding:0 1px}
+  .stars button.on{color:var(--star)}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:10px}
+  .pred{color:var(--star);font-weight:600}
+  .muted{color:var(--muted)} .small{font-size:13px}
+  .bar{height:6px;border-radius:3px;background:var(--accent-soft);overflow:hidden;margin-top:4px}
+  .bar > div{height:100%;background:var(--accent)}
+  button.reset{font:inherit;border:1px solid var(--border);background:transparent;color:inherit;border-radius:8px;padding:4px 12px;cursor:pointer}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+  <a href="index.html">&larr; All steps</a>
+  <h1>Step 3: Collaborative filtering</h1>
+  <p class="muted">No tags this time. We compare <b>your star ratings</b> with other users', find the people whose taste is most similar (Pearson-style, mean-centered similarity), then predict how you'd rate items you haven't seen from what those neighbors thought.</p>
+
+  <div class="cols">
+    <section>
+      <h2>Rate items</h2>
+      <div id="rate"></div>
+      <button class="reset" id="reset">Clear my ratings</button>
+    </section>
+    <section>
+      <h2>Your nearest neighbors</h2>
+      <div id="neighbors"></div>
+      <h2>Predicted for you</h2>
+      <div id="recs"></div>
+    </section>
+  </div>
+
+<script>
+// ---- 1. DATA: items + other users' ratings (itemId -> 1..5) ----
+const items = [
+  { id: 1,  title: "Starfall Odyssey" },   { id: 2,  title: "The Quiet Orchard" },
+  { id: 3,  title: "Neon Alley" },         { id: 4,  title: "Laugh Track" },
+  { id: 5,  title: "Deep Current" },       { id: 6,  title: "The Last Cartographer" },
+  { id: 7,  title: "Robot Chef" },         { id: 8,  title: "Midnight Ledger" },
+  { id: 9,  title: "Dragon's Hollow" },    { id: 10, title: "Orbit of Two" },
+  { id: 11, title: "Paper Hearts" },       { id: 12, title: "Cold Case Files" }
+];
+const byId = new Map(items.map(i => [i.id, i]));
+
+const users = {
+  Ava:  { 1: 5, 3: 4, 10: 5, 7: 3, 2: 1, 6: 4 },
+  Ben:  { 2: 5, 11: 4, 4: 3, 9: 4, 1: 2, 10: 3 },
+  Cleo: { 3: 5, 8: 4, 5: 5, 12: 4, 1: 3, 4: 1 },
+  Dev:  { 9: 5, 6: 5, 1: 4, 4: 3, 7: 4, 12: 2 },
+  Eli:  { 8: 5, 12: 5, 5: 4, 3: 3, 11: 1, 9: 2 },
+  Fay:  { 11: 5, 10: 4, 2: 4, 4: 4, 8: 1, 7: 3 }
+};
+
+// ---- 2. STATE: my ratings, saved in the browser when possible ----
+const KEY = "cf-demo-ratings";
+let mine = {};
+try { mine = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { mine = {}; }
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(mine)); } catch (e) {} };
+
+// ---- 3. MATH ----
+const mean = r => { const v = Object.values(r); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0; };
+
+// Mean-centered similarity over co-rated items, damped when overlap is small
+function similarity(a, b) {
+  const common = Object.keys(a).filter(k => k in b);
+  if (common.length === 0) return { sim: 0, common: 0 };
+  const ma = mean(a), mb = mean(b);
+  let num = 0, da = 0, db = 0;
+  common.forEach(k => {
+    const x = a[k] - ma, y = b[k] - mb;
+    num += x * y; da += x * x; db += y * y;
+  });
+  const raw = (da && db) ? num / Math.sqrt(da * db) : 0;
+  const damp = Math.min(common.length, 3) / 3;     // trust 1 shared item less than 3+
+  return { sim: raw * damp, common: common.length };
+}
+
+// ---- 4. FIND NEIGHBORS: top-K users with positive similarity ----
+function neighbors(k = 3) {
+  return Object.entries(users)
+    .map(([name, ratings]) => ({ name, ratings, mean: mean(ratings), ...similarity(mine, ratings) }))
+    .filter(n => n.sim > 0)
+    .sort((a, b) => b.sim - a.sim)
+    .slice(0, k);
+}
+
+// ---- 5. PREDICT: my mean + weighted average of neighbors' deviations ----
+function predict(itemId, nbrs) {
+  let num = 0, den = 0;
+  const fans = [];
+  nbrs.forEach(n => {
+    const r = n.ratings[itemId];
+    if (r !== undefined) {
+      num += n.sim * (r - n.mean);
+      den += Math.abs(n.sim);
+      if (r >= 4) fans.push(n.name);
+    }
+  });
+  if (!den) return null;
+  return { rating: Math.min(5, Math.max(1, mean(mine) + num / den)), fans };
+}
+
+function recommend(limit = 5) {
+  const nbrs = neighbors();
+  const recs = items
+    .filter(i => !(i.id in mine))
+    .map(i => ({ item: i, p: predict(i.id, nbrs) }))
+    .filter(r => r.p && r.p.rating >= 3)
+    .sort((a, b) => b.p.rating - a.p.rating)
+    .slice(0, limit);
+  return { nbrs, recs };
+}
+
+// ---- 6. UI ----
+const starText = n => "★".repeat(Math.round(n)) + "☆".repeat(5 - Math.round(n));
+
+function renderRatings() {
+  const box = document.getElementById("rate");
+  box.innerHTML = "";
+  items.forEach(item => {
+    const row = document.createElement("div");
+    row.className = "row";
+    const stars = [1, 2, 3, 4, 5].map(s =>
+      `<button data-s="${s}" class="${(mine[item.id] || 0) >= s ? "on" : ""}" aria-label="${s} stars">★</button>`).join("");
+    row.innerHTML = `<span>${item.title}</span><span class="stars">${stars}</span>`;
+    row.querySelectorAll("button").forEach(b => b.onclick = () => {
+      const s = Number(b.dataset.s);
+      mine[item.id] === s ? delete mine[item.id] : (mine[item.id] = s);   // click same star again to clear
+      save(); render();
+    });
+    box.appendChild(row);
+  });
+}
+
+function render() {
+  renderRatings();
+  const count = Object.keys(mine).length;
+  const { nbrs, recs } = recommend();
+
+  document.getElementById("neighbors").innerHTML = count < 2
+    ? `<p class="muted">Rate at least 2 items to find people like you.</p>`
+    : nbrs.length
+      ? nbrs.map(n => `
+          <div class="card">
+            <strong>${n.name}</strong> <span class="small muted">· ${(n.sim * 100).toFixed(0)}% similar · ${n.common} shared ratings</span>
+            <div class="bar"><div style="width:${n.sim * 100}%"></div></div>
+          </div>`).join("")
+      : `<p class="muted">No one matches your taste yet. Try rating a few more items, using a mix of high and low stars.</p>`;
+
+  document.getElementById("recs").innerHTML = recs.length
+    ? recs.map(r => `
+        <div class="card">
+          <strong>${r.item.title}</strong><br>
+          <span class="pred">${starText(r.p.rating)} ${r.p.rating.toFixed(1)}</span>
+          <div class="small muted">${r.p.fans.length ? "Loved by " + r.p.fans.join(", ") : "Based on your neighbors' ratings"}</div>
+        </div>`).join("")
+    : `<p class="muted">${count < 2 ? "Predictions appear once you have neighbors." : "No confident predictions yet."}</p>`;
+}
+
+document.getElementById("reset").onclick = () => { mine = {}; save(); render(); };
+render();
+</script>
+</body>
+</html>
